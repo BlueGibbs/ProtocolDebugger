@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Song Display</title>
+    <style>
+        :root {
+            --bg: #0f1720;
+            --panel: #0b1220;
+            --accent: #60a5fa;
+            --text: #e6eef8;
+            --muted: #9fb0c8;
+        }
+
+        html, body {
+            height: 100%;
+            margin: 0;
+            background: linear-gradient(180deg,#071226 0%,var(--bg) 100%);
+            color: var(--text);
+            font-family: Inter,Segoe UI,system-ui,Roboto,"Helvetica Neue",Arial;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 28px auto;
+            padding: 20px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.02));
+            border-radius: 12px;
+            box-shadow: 0 8px 30px rgba(2,6,23,0.6);
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 18px
+        }
+
+        .meta {
+            display: flex;
+            flex-direction: column
+        }
+
+        .title {
+            font-size: 1.25rem;
+            font-weight: 600
+        }
+
+        .author {
+            color: var(--muted);
+            font-size: 0.9rem;
+            margin-top: 4px
+        }
+
+        .status {
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        .pulse {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%
+        }
+
+            .pulse.online {
+                background: linear-gradient(90deg,#34d399,#10b981);
+                box-shadow: 0 0 8px rgba(16,185,129,0.15)
+            }
+
+            .pulse.offline {
+                background: #444
+            }
+
+        .controls {
+            display: flex;
+            gap: 8px
+        }
+
+        button {
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.06);
+            color: var(--text);
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer
+        }
+
+            button.secondary {
+                background: transparent;
+                border: 1px solid rgba(255,255,255,0.04);
+                color: var(--muted)
+            }
+
+        section.verse {
+            padding: 18px;
+            border-radius: 10px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.00));
+            min-height: 220px
+        }
+
+        .verse .heading {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 8px
+        }
+
+        .verse .type {
+            font-weight: 700;
+            color: var(--accent);
+            font-size: 0.95rem
+        }
+
+        .verse .vtitle {
+            color: var(--text);
+            font-size: 1.05rem
+        }
+
+        .lyrics {
+            white-space: pre-wrap;
+            font-size: 1.05rem;
+            line-height: 1.5;
+            color: var(--text);
+        }
+
+        .footer {
+            margin-top: 12px;
+            color: var(--muted);
+            font-size: 0.9rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center
+        }
+
+        .small {
+            font-size: 0.85rem;
+            color: var(--muted)
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="meta">
+                <div class="title" id="songTitle">—</div>
+                <div class="author" id="songAuthor">—</div>
+            </div>
+
+            <div class="status">
+                <div id="dot" class="pulse offline" title="connection status"></div>
+                <div class="controls">
+                    <button id="btnReconnect">Reconnect</button>
+                </div>
+            </div>
+        </header>
+
+        <section class="verse" id="versePanel">
+            <div class="heading">
+                <div class="type" id="verseType">—</div>
+                <div class="vtitle" id="verseTitle">—</div>
+            </div>
+            <div class="lyrics" id="lyrics">Waiting for data…</div>
+        </section>
+
+        <div class="footer">
+            <div class="small" id="guid">GUID: —</div>
+            <div class="small" id="info">Connection attempts: <span id="attempts">0</span></div>
+        </div>
+    </div>
+
+    <script>(() => {
+  const url = 'http://localhost:2323/display';
+  let controller = null;
+  let reader = null;
+  let buffer = '';
+  let backoff = 1000;           // ms
+  const maxBackoff = 30000;     // 30s
+  let attempts = 0;
+  let isConnected = false;
+
+  const el = {
+    dot: document.getElementById('dot'),
+    title: document.getElementById('songTitle'),
+    author: document.getElementById('songAuthor'),
+    verseType: document.getElementById('verseType'),
+    verseTitle: document.getElementById('verseTitle'),
+    lyrics: document.getElementById('lyrics'),
+    guid: document.getElementById('guid'),
+    attempts: document.getElementById('attempts'),
+    btnReconnect: document.getElementById('btnReconnect')
+  };
+
+  el.btnReconnect.addEventListener('click', () => {
+    stopStream();
+    setTimeout(startStream, 200);
+  });
+
+  window.addEventListener('beforeunload', () => stopStream());
+
+  function setStatus(connected) {
+    isConnected = connected;
+    el.dot.classList.toggle('online', connected);
+    el.dot.classList.toggle('offline', !connected);
+  }
+
+  // Escape HTML to avoid injection, then convert line breaks to <br>
+  function renderLyricsRaw(text) {
+    if (text == null) return '';
+    const esc = text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    return esc.replace(/\r\n|\r|\n/g, '<br>');
+  }
+
+  // Attempt to extract complete top-level JSON objects from a buffer string.
+  // This handles strings and escaped quotes so braces inside strings are ignored.
+  function extractJsonObjectsFromBuffer() {
+    const results = [];
+    let i = 0;
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+
+    while (i < buffer.length) {
+      const ch = buffer[i];
+
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (ch === '\\') {
+          escape = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+      } else {
+        if (ch === '"') {
+          inString = true;
+        } else if (ch === '{') {
+          if (depth === 0) start = i;
+          depth++;
+        } else if (ch === '}') {
+          depth--;
+          if (depth === 0 && start !== -1) {
+            const jsonText = buffer.substring(start, i + 1);
+            results.push(jsonText);
+            // remove consumed part by advancing start marker
+            buffer = buffer.substring(i + 1);
+            // reset scanning to beginning of new buffer
+            i = -1;
+            start = -1;
+          } else if (depth < 0) {
+            // malformed; reset
+            buffer = buffer.substring(i + 1);
+            i = -1;
+            depth = 0;
+            start = -1;
+          }
+        }
+      }
+      i++;
+    }
+    return results;
+  }
+
+  function clearAllText() {
+    el.title.textContent = '';
+    el.author.textContent = '';
+    el.guid.textContent = '';
+    el.verseType.textContent = '';
+    el.verseTitle.textContent = '';
+    el.lyrics.textContent = '';
+  }
+
+  function handleJsonObject(obj) {
+    // update UI with parsed object
+    try {
+      const meta = obj;
+
+      // If the payload type is not "Song", remove all text from the screen.
+      if (String(meta.Type) !== 'Song') {
+        clearAllText();
+        return;
+      }
+
+      // Proceed only for Song-type payloads
+      el.title.textContent = meta.Title || '—';
+      el.author.textContent = meta.Author || '—';
+      el.guid.textContent = 'GUID: ' + (meta.Guid || '—');
+
+      // CurrentItemIndex may be string like "1"
+      const idxStr = meta.CurrentItemIndex ?? meta.CurrentIndex ?? null;
+      let verse = null;
+
+      if (Array.isArray(meta.SongVerses)) {
+        // Prefer matching by Id
+        if (idxStr != null) {
+          verse = meta.SongVerses.find(v => String(v.Id) === String(idxStr));
+        }
+        // fallback: treat as 1-based index
+        if (!verse) {
+          const idx = parseInt(idxStr, 10);
+          if (!Number.isNaN(idx) && idx > 0 && idx <= meta.SongVerses.length) {
+            verse = meta.SongVerses[idx - 1];
+          }
+        }
+        // fallback: first verse
+        if (!verse) verse = meta.SongVerses[0];
+      }
+
+      if (verse) {
+        el.verseType.textContent = verse.Type || '';
+        el.verseTitle.textContent = verse.Title || '';
+        el.lyrics.innerHTML = renderLyricsRaw(verse.Lyrics || '');
+      } else {
+        el.verseType.textContent = '';
+        el.verseTitle.textContent = '';
+        el.lyrics.textContent = 'No verse available';
+      }
+    } catch (err) {
+      console.warn('Error applying JSON object', err);
+    }
+  }
+
+  function scheduleReconnect(reason) {
+    attempts++;
+    el.attempts.textContent = attempts;
+    setStatus(false);
+    console.warn('Connection lost. Reconnecting in', Math.round(backoff/1000), 's', reason || '');
+    setTimeout(() => startStream(), backoff);
+    backoff = Math.min(maxBackoff, Math.round(backoff * 1.8));
+  }
+
+  function stopStream() {
+    try {
+      if (reader && reader.cancel) reader.cancel();
+    } catch(e) {}
+    try { if (controller) controller.abort(); } catch(e) {}
+    reader = null;
+    controller = null;
+  }
+
+  function startStream() {
+    stopStream();
+    controller = new AbortController();
+    buffer = '';
+    backoff = 1000; // reset backoff on manual start
+    fetch(url, { signal: controller.signal, cache: 'no-store' })
+      .then(response => {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        if (!response.body) throw new Error('No response body (streaming not supported by this transport).');
+        setStatus(true);
+        attempts = 0;
+        el.attempts.textContent = attempts;
+        const decoder = new TextDecoder();
+        reader = response.body.getReader();
+
+        function readChunk() {
+          reader.read().then(({done, value}) => {
+            if (done) {
+              // server closed stream cleanly
+              scheduleReconnect('server closed connection');
+              return;
+            }
+            // append decoded text to buffer and attempt to extract JSON objects
+            buffer += decoder.decode(value, { stream: true });
+            const jsonTexts = extractJsonObjectsFromBuffer();
+            for (const jt of jsonTexts) {
+              try {
+                const obj = JSON.parse(jt);
+                handleJsonObject(obj);
+              } catch (err) {
+                console.warn('Failed to parse JSON chunk, keeping buffer for more data', err);
+                // when parsing fails, we keep buffer until more data arrives
+              }
+            }
+            // Continue reading
+            readChunk();
+          }).catch(err => {
+            if (err.name === 'AbortError') {
+              // intentional abort
+              console.info('Stream aborted');
+            } else {
+              console.error('Read error', err);
+              scheduleReconnect('read error');
+            }
+          });
+        }
+
+        readChunk();
+      })
+      .catch(err => {
+        console.warn('Fetch failed', err);
+        scheduleReconnect('fetch failed');
+      });
+  }
+
+  // start immediately
+  startStream();
+})();</script>
+</body>
+</html>
